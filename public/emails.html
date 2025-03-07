@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Caixa de Entrada</title>
+</head>
+<body>
+    <h1>📩 E-mails Recebidos</h1>
+    <ul id="email-list"></ul>
+
+    <script>
+        async function loadEmails() {
+            try {
+                const response = await fetch('http://localhost:3000/mail/fetch');
+                const emails = await response.json();
+
+                const emailList = document.getElementById('email-list');
+                emailList.innerHTML = ''; // Limpa a lista antes de carregar
+
+                emails.forEach(email => {
+                    const li = document.createElement('li');
+                    li.innerHTML = `<strong>De:</strong> ${email.from} <br> 
+                                    <strong>Núcleo do email:</strong> ${email.coreMessage} <br>
+                                    <strong>Assunto:</strong> ${email.subject} <br> 
+                                    <strong>Mensagem:</strong> ${email.body} <br><hr>`;
+                    emailList.appendChild(li);
+                });
+
+            } catch (error) {
+                console.error('Erro ao carregar os e-mails:', error);
+            }
+        }
+
+        // Carregar os e-mails ao abrir a página
+        loadEmails();
+    </script>
+</body>
+</html>
