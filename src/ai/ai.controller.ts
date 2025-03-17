@@ -11,7 +11,7 @@ export class AiController {
   @Get('chat')
   async getResponse(@Query('message') message: string) {
     try {
-      const response = await this.aiService.getGeminiResponse('1', message);
+      const response = await this.aiService.getGeminiResponse('1', message, 'helena');
 
       return {
         success: true,

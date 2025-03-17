@@ -11,7 +11,7 @@ import { PdfModule } from './pdf/pdf.module';
   imports: [
     AiModule,
     ConfigModule.forRoot({
-      envFilePath: '.development.env',
+      envFilePath: '.env.development.local',
     }),
     MailModule,
     PdfModule,

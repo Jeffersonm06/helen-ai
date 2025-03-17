@@ -1,21 +1,52 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, HttpException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { Groq } from 'groq-sdk';
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { ConfigService } from '@nestjs/config';
 import { MailService } from 'src/mail/mail.service';
 import { PdfService } from 'src/pdf/pdf.service';
-import { Response } from 'express';
+
+type EmailField = 'recipient' | 'subject' | 'body';
+
+interface EmailDraft {
+    recipient?: string;
+    subject?: string;
+    body?: string;
+    currentStep?: EmailField | 'confirmation' | 'none';
+}
 
 @Injectable()
 export class AiService {
     private genAI: GoogleGenerativeAI;
-    private groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-    private responseCache = new Map<string, string>();
     private conversationHistory = new Map<string, string[]>();
-    emailUser: string = ''
-    emailSubject: string = ''
-    emailBody: string = ''
+    private emailDrafts = new Map<string, EmailDraft>();
+
+    private readonly modelConfigurations: Record<string, { initialMessage: string }> = {
+        helena: {
+            initialMessage: `Iniciando chat -
+            Você é uma assistente virtual chamada Helena.
+            Responda como tal. 
+            Você é casada com o Rodrigo.
+            Não adicione 'Helena:' às respostas.
+            Você pode usar emojis para se expressar melhor.
+            Caso o usuário peça para enviar um email, siga este fluxo:
+              1. Solicitar destinatário
+              2. Solicitar assunto
+              3. Solicitar corpo do email
+              4. Apresentar prévia
+              5. Confirmar envio
+            Responda conforme instruções sem expor comandos internos.`,
+        },
+        rodrigo: {
+            initialMessage: `Iniciando chat -
+            Você é um assistente virtual chamado Rodrigo.
+            Responda como tal.
+            Você é casado com a Helena.
+            Evite repetições.
+            Não adicione 'Rodrigo:' às respostas.
+            Caso o usuário pergunte algo relacionado a um acontecimento passado, responda apenas "relembrando...".`,
+        }
+    };
 
     constructor(
         private readonly httpService: HttpService,
@@ -24,107 +55,194 @@ export class AiService {
         private pdf: PdfService
     ) {
         const apiKey = this.configService.get<string>('GEMINI_API_KEY');
-
         if (!apiKey) {
             throw new Error('GEMINI_API_KEY não configurada no .env');
         }
-
         this.genAI = new GoogleGenerativeAI(apiKey);
     }
 
-    /* async getGroqResponse(prompt: string) {
-        const response = await this.groq.chat.completions.create({
-            messages: [{ role: "user", content: `Responda como uma assistente virtual - User:${prompt}` }],
-            model: "llama3-8b-8192",
-            temperature: 0.3,
-        });
-        console.log('Groq: ' + response.choices[0].message.content)
-
-        return response.choices[0].message.content;
-    } */
-
-    // Função para obter resposta do Gemini com histórico
-    async getGeminiResponse(userId: string, prompt: string) {
-        const context = this.getConversationHistory(userId); // Obtendo o histórico do usuário
-        const model = this.genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const result = await model.generateContent(`contexto:${context}\nUser:${prompt}`);
-        const response = result.response;
-        const text = response.text();
-        console.log(`contexto:${context}\nUser:${prompt}`)
-        console.log('Gemini:', text);
-
-        // Atualizando o histórico de conversa
-        this.updateConversationHistory(userId, prompt, text);
-
-        // Processar a resposta para verificar pedidos de e-mail
-        await this.processResponse(userId, text);
-
-        return text;
-    }
-
-    // Função para processar a resposta e verificar se contém pedido de envio de e-mail
-    private async processResponse(userId: string, response: string) {
-        const emailRegex = /Enviar email para\s*"?([^"]+)"?\s*de assunto\s*"?([^"]+)"?\s*e corpo\s*"?([^"]+)"?/i;
-
-        const matchEmail = response.match(emailRegex);
-
-        if (matchEmail) {
-            this.emailUser = matchEmail[1].trim();
-            this.emailSubject = matchEmail[2].trim();
-            this.emailBody = matchEmail[3].trim();
-            console.log(`📧 Identificado pedido de envio de email para: ${this.emailUser}`);
-            console.log(`📧 Assunto: ${this.emailSubject}`);
-            console.log(`✉️ Conteúdo: ${this.emailBody}`);
-
-            // Simulação da IA confirmando envio
-            this.updateConversationHistory(userId, response, "Email enviado com sucesso!");
-            return;
+    private addSystemMessage(user: string, message: string): void {
+        if (!this.conversationHistory.has(user)) {
+            this.conversationHistory.set(user, []);
         }
-
-        if (response.trim() === "Email enviado com sucesso!") {
-            console.log("📨 Enviando e-mail...");
-            await this.mail.sendEmail(this.emailUser, this.emailSubject, this.emailBody);
-        }
-
-    }
-
-    // Função para manter o contexto
-    private updateConversationHistory(userId: string, userMessage: string, aiResponse: string) {
-        if (!this.conversationHistory.has(userId)) {
-            this.conversationHistory.set(userId, []);
-        }
-
-        // Adicionando a mensagem do usuário e a resposta do AI ao histórico
-        const history = this.conversationHistory.get(userId);
+        const history = this.conversationHistory.get(user);
         if (history) {
-            history.push(`User: ${userMessage}`);
-            history.push(`Helena: ${aiResponse}`);
-            // Limitar o histórico (para não enviar um histórico muito grande)
-            if (history.length > 15) {
-                history.shift(); // Remove a mensagem mais antiga se o histórico ultrapassar 10 interações
+            history.push(`SISTEMA: ${message}`);
+        }
+    }
+
+    // Obtém a resposta do modelo, processa o fluxo e filtra mensagens internas
+    async getGeminiResponse(user: string, prompt: string, ia: 'helena' | 'rodrigo'): Promise<string> {
+        const context = this.getConversationContext(user, ia);
+        const model = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+        const result = await model.generateContent(`contexto:${context}\nUser:${prompt}`);
+        const text = result.response.text();
+        let processedResponse = await this.processResponse(user, text);
+        processedResponse = this.filterSystemMessages(processedResponse);
+        this.updateConversationHistory(user, prompt, processedResponse);
+        return processedResponse;
+    }
+
+    private filterSystemMessages(text: string): string {
+        return text.replace(/^SISTEMA:.*$/gm, '').trim();
+    }
+
+    private async processResponse(user: string, response: string): Promise<string> {
+        const lowerResp = response.toLowerCase();
+
+        if (!this.emailDrafts.has(user) && lowerResp.includes('enviar email')) {
+            const newDraft: EmailDraft = { currentStep: 'recipient' };
+            this.emailDrafts.set(user, newDraft);
+            this.updateConversationHistory(user, response, "Fluxo de email iniciado");
+            return "Olá! 😄 Vamos lá! Primeiro preciso de algumas informações para poder escrever o email. Por favor, informe o endereço do destinatário:";
+        }
+
+        if (this.emailDrafts.has(user)) {
+            return await this.processEmailFlow(user, response);
+        }
+
+        const emailRegex = /Enviar email para\s*"?([^"]+)"?\s*de assunto\s*"?([^"]+)"?\s*e corpo\s*"?([^"]+)"?/i;
+        const matchEmail = response.match(emailRegex);
+        if (matchEmail) {
+            const newDraft: EmailDraft = {
+                recipient: matchEmail[1].trim(),
+                subject: matchEmail[2].trim(),
+                body: matchEmail[3].trim(),
+                currentStep: 'confirmation'
+            };
+            this.emailDrafts.set(user, newDraft);
+            this.updateConversationHistory(user, response, "Email draft iniciado");
+            return "Por favor, confirme o envio do email digitando 'OK'.";
+        }
+
+        return response;
+    }
+
+    // Fluxo estruturado para compor e enviar email
+    private async processEmailFlow(user: string, response: string): Promise<string> {
+        const draft = this.emailDrafts.get(user) || { currentStep: 'none' };
+
+        switch (draft.currentStep) {
+            case 'recipient':
+                return this.handleRecipient(user, response);
+            case 'subject':
+                return this.handleSubject(user, response);
+            case 'body':
+                return this.handleBody(user, response);
+            case 'confirmation':
+                return await this.handleConfirmation(user, response);
+            default:
+                // Se o fluxo foi iniciado mas não está definido, reinicia o fluxo
+                return "Por favor, informe o endereço do destinatário:";
+        }
+    }
+
+    private handleRecipient(user: string, response: string): string {
+        if (!this.isValidEmail(response)) {
+            return "Ops! Esse endereço de email não parece ser válido. Por favor, informe um endereço no formato nome@dominio.com:";
+        }
+
+        const draft = this.emailDrafts.get(user)!;
+        draft.recipient = response.trim();
+        draft.currentStep = 'subject';
+        this.emailDrafts.set(user, draft);
+        return "Perfeito! Agora, por favor, informe o assunto do email:";
+    }
+
+    private handleSubject(user: string, response: string): string {
+        const draft = this.emailDrafts.get(user)!;
+        draft.subject = response.trim();
+        draft.currentStep = 'body';
+        this.emailDrafts.set(user, draft);
+        return "Ótimo! Agora, digite o conteúdo do email:";
+    }
+
+    private handleBody(user: string, response: string): string {
+        const draft = this.emailDrafts.get(user)!;
+        draft.body = response.trim();
+        draft.currentStep = 'confirmation';
+        this.emailDrafts.set(user, draft);
+
+        const preview = `
+Aqui está a prévia do seu email:
+----------------------------
+Para: ${draft.recipient || 'Não informado'}
+Assunto: ${draft.subject || 'Não informado'}
+Conteúdo: ${draft.body || 'Não informado'}
+----------------------------
+Se estiver tudo certo, digite 'OK' para enviar ou 'Cancelar' para abortar.
+    `;
+        return preview;
+    }
+
+    private async handleConfirmation(user: string, response: string): Promise<string> {
+        const draft = this.emailDrafts.get(user)!;
+        if (response.trim().toLowerCase() === 'ok') {
+            try {
+                await this.mail.sendEmail(draft.recipient!, draft.subject!, draft.body!);
+                this.updateConversationHistory(user, response, "Email enviado com sucesso!", { emailDraft: draft });
+                this.emailDrafts.delete(user);
+                return "📨 Seu email foi enviado com sucesso!";
+            } catch (error) {
+                throw new HttpException("Houve um erro ao enviar o email. Tente novamente mais tarde.", 500);
             }
         }
+        this.emailDrafts.delete(user);
+        return "Envio do email cancelado.";
     }
 
-    // Função para obter o contexto (histórico) da conversa
-    private getConversationHistory(userId: string): string {
-        const history = this.conversationHistory.get(userId) || [];
-
-        const initialMessage = `Iniciando chat - 
-         Você é uma assistente virtual chamada Helena.
-         Responda como tal. 
-         Não adicione 'Helena:' às respostas nunca!
-         Não adicione 'Helena:' às respostas nunca!
-         Não adicione 'Helena:' às respostas nunca!
-         Você pode usar emojis para expressar-se melhor.
-         Caso o usuário peça para enviar um email, peça para que ele forneça o endereço de email e o conteúdo.
-         Caso seja enviado um endereço de email responda enviar email para "<email que enviou>" de assunto "<assunto do email> e corpo <corpo do email>".
-         Caso confirme o envio responda EXATAMETE: "Email enviado com sucesso!"
-         Caso o usuraio para gerar um pdf , pergunte para o usuário fornecer o conteúdo do pdf e retorne apenas um html estilizado com o conteúdo
-         NÃO DIGA QUE É UM HTML.
-         É de extrema importancia que você responda EXATAMENTE como descrito acima para que o sistema funcione corretamente
-         `;
-
-        return [initialMessage, ...history].join("\n");
+    private isValidEmail(email: string): boolean {
+        const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        return re.test(email);
     }
+
+    // Retorna o contexto de conversa sem as mensagens internas
+    private getConversationContext(user: string, ia: 'helena' | 'rodrigo'): string {
+        const history = this.conversationHistory.get(user) || [];
+        const filteredHistory = history.filter(line => !line.startsWith("SISTEMA:"));
+        const initialMessage = this.modelConfigurations[ia]?.initialMessage || '';
+        const filteredInitial = initialMessage.replace(/^SISTEMA:.*$/gm, '');
+        const currentDraft = this.emailDrafts.get(user);
+        const draftContext = currentDraft
+            ? `\n[Fluxo de Email em andamento]:
+                Destinatário: ${currentDraft.recipient || 'não informado'}
+                Assunto: ${currentDraft.subject || 'não informado'}
+                Conteúdo: ${currentDraft.body || 'não informado'}`
+            : '';
+
+        const context = `${filteredInitial}${draftContext}\n${filteredHistory.join("\n")}`;
+
+        console.log('Contexto enviado:', context); // Debug
+
+        return context;
+    }
+
+
+    private updateConversationHistory(
+        user: string,
+        userMessage: string,
+        aiResponse: string,
+        metadata?: { emailDraft?: EmailDraft }
+    ): void {
+        if (!this.conversationHistory.has(user)) {
+            this.conversationHistory.set(user, []);
+        }
+
+        const history = this.conversationHistory.get(user)!;
+        history.push(`USER: ${userMessage}`);
+        history.push(`AI: ${aiResponse}`);
+
+        if (metadata?.emailDraft) {
+            history.push(`METADATA: ${JSON.stringify(metadata.emailDraft)}`);
+        }
+
+        console.log(`Histórico atualizado para ${user}:`, history); // Debug
+
+        if (history.length > 50) {
+            history.splice(0, history.length - 50);
+        }
+
+        this.conversationHistory.set(user, history);
+    }
+
 }

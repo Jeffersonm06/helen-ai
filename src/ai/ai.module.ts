@@ -5,6 +5,7 @@ import { HttpModule } from '@nestjs/axios';
 import { ConfigModule } from '@nestjs/config';
 import { MailModule } from 'src/mail/mail.module';
 import { PdfModule } from 'src/pdf/pdf.module';
+import { ChatGateway } from './chat.gateway';
 
 
 @Module({
@@ -15,6 +16,6 @@ import { PdfModule } from 'src/pdf/pdf.module';
     PdfModule
   ],
   controllers: [AiController],
-  providers: [AiService],
+  providers: [AiService, ChatGateway],
 })
 export class AiModule {}
